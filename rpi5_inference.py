@@ -22,17 +22,12 @@ Place this script alongside:
   - scaler_scale.npy
 """
 
-import sys
 import numpy as np
 import json
 import time
 
 # --- Use tflite_runtime for minimal footprint on RPi 5 ---
-# Falls back to full TensorFlow if tflite_runtime is not installed.
-try:
-    from tflite_runtime.interpreter import Interpreter
-except ImportError:
-    from tensorflow.lite.python.interpreter import Interpreter
+from tflite_runtime.interpreter import Interpreter
 
 # ============================================================
 # Load model and preprocessing parameters
