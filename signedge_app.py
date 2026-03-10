@@ -6,7 +6,11 @@ This app uses a single OpenCV rendering loop for better responsiveness on Pi:
     - TFLite MLP inference loaded directly inside this app
     - Stable-hold sign commit for A-Z, SPACE, and DEL
     - Camera-based dwell-to-send interaction
-    - Offline speech output through espeak-ng or espeak
+    - Offline neural speech via Piper TTS (piper1-gpl), falls back to espeak-ng
+
+Piper setup (one-time on the Pi):
+    pip install piper-tts
+    python3 -m piper.download_voices en_US-lessac-medium
 """
 
 import os
@@ -40,6 +44,12 @@ RELEASE_SECONDS = 0.30
 SEND_DWELL_SECONDS = 1.75
 SEND_ZONE_RATIO = 0.22
 TTS_RATE = 165
+PIPER_VOICE = "en_US-amy-medium"
+
+TOP_BAR_H = 110
+BOTTOM_BAR_H = 160
+SIDE_PANEL_W = 220
+PANEL_BG = (18, 24, 32)
 
 
 def normalize_prediction_label(label):
@@ -241,14 +251,45 @@ class OfflineSpeaker:
         self.command_queue = queue.Queue()
         self.event_queue = queue.Queue()
         self.stop_event = threading.Event()
+        self.piper_voice = None
+        self.tts_command = None
+
+        engine_name, piper_issue = self._load_piper()
+        if engine_name is None:
+            print(f"[TTS] Piper not loaded: {piper_issue} — falling back to espeak-ng")
+            engine_name = self._load_espeak()
+
+        self.aplay_command = shutil.which("aplay")
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+        self._publish("ready", f"Speech ready via {engine_name}")
+
+    def _load_piper(self):
+        """Try to load Piper TTS. Returns (engine_name, None) on success, (None, reason) on failure."""
+        try:
+            from piper import PiperVoice  # type: ignore[import]
+        except ImportError:
+            return None, "piper-tts not installed (run: pip install piper-tts)"
+
+        model_path = Path(__file__).resolve().parent / f"{PIPER_VOICE}.onnx"
+        if not model_path.exists():
+            return None, f"model file not found: {model_path}"
+
+        try:
+            self.piper_voice = PiperVoice.load(str(model_path))
+            return f"piper ({PIPER_VOICE})", None
+        except Exception as exc:
+            return None, f"PiperVoice.load failed: {exc}"
+
+    def _load_espeak(self):
+        """Fall back to espeak-ng / espeak. Raises if neither is available."""
         self.tts_command = shutil.which("espeak-ng") or shutil.which("espeak")
         if not self.tts_command:
             raise RuntimeError(
-                "Install espeak-ng on Raspberry Pi: sudo apt install espeak-ng"
+                "No TTS engine found. Install piper-tts (pip install piper-tts) "
+                "or espeak-ng (sudo apt install espeak-ng)."
             )
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
-        self._publish("ready", f"Speech ready via {Path(self.tts_command).name}")
+        return Path(self.tts_command).name
 
     def speak(self, text):
         self.command_queue.put(text)
@@ -269,16 +310,75 @@ class OfflineSpeaker:
 
             try:
                 self._publish("status", f"Speaking: {text}")
-                subprocess.run(
-                    [self.tts_command, "-s", str(TTS_RATE), text],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
+                if self.piper_voice is not None:
+                    self._speak_piper(text)
+                else:
+                    self._speak_espeak(text)
                 self._publish("spoken", text)
             except Exception as exc:
                 self._publish("error", f"Speech failed: {exc}")
+
+    def _speak_piper(self, text):
+        chunks = list(self.piper_voice.synthesize(text))
+        if not chunks:
+            return
+
+        first = chunks[0]
+        sample_rate = first.sample_rate
+        channels = first.sample_channels
+
+        if self.aplay_command:
+            proc = subprocess.Popen(
+                [
+                    self.aplay_command,
+                    "-r", str(sample_rate),
+                    "-f", "S16_LE",
+                    "-c", str(channels),
+                    "-t", "raw",
+                    "-",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            for chunk in chunks:
+                proc.stdin.write(chunk.audio_int16_bytes)
+            proc.stdin.close()
+            proc.wait()
+        else:
+            # aplay unavailable — write WAV to a temp file and play via ffplay
+            import io
+            import tempfile
+            import wave
+
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                for chunk in chunks:
+                    wf.writeframes(chunk.audio_int16_bytes)
+
+            ffplay = shutil.which("ffplay")
+            if ffplay:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(buf.getvalue())
+                    tmp_path = tmp.name
+                subprocess.run(
+                    [ffplay, "-nodisp", "-autoexit", tmp_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                Path(tmp_path).unlink(missing_ok=True)
+
+    def _speak_espeak(self, text):
+        subprocess.run(
+            [self.tts_command, "-s", str(TTS_RATE), text],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
 
 class SignEdgeApp:
@@ -326,7 +426,7 @@ class SignEdgeApp:
 
     def run(self):
         cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW_TITLE, 1280, 720)
+        cv2.resizeWindow(WINDOW_TITLE, CAMERA_WIDTH + SIDE_PANEL_W, TOP_BAR_H + CAMERA_HEIGHT + BOTTOM_BAR_H)
 
         try:
             while True:
@@ -419,79 +519,72 @@ class SignEdgeApp:
         )
 
     def _decorate_frame(self, analysis, compose_result, in_send_zone):
-        frame = analysis.frame.copy()
-        height, width = frame.shape[:2]
+        cam_h, cam_w = analysis.frame.shape[:2]
+        canvas_w = cam_w + SIDE_PANEL_W
+        canvas_h = TOP_BAR_H + cam_h + BOTTOM_BAR_H
 
-        top_panel = frame.copy()
-        cv2.rectangle(top_panel, (0, 0), (width, 112), (4, 12, 20), -1)
-        cv2.addWeighted(top_panel, 0.72, frame, 0.28, 0, frame)
+        canvas = np.full((canvas_h, canvas_w, 3), PANEL_BG, dtype=np.uint8)
 
+        # Camera feed (skeleton already drawn on it) — untouched camera pixels
+        canvas[TOP_BAR_H:TOP_BAR_H + cam_h, 0:cam_w] = analysis.frame
+
+        # ── TOP BAR ──────────────────────────────────────────────────────────
         current_label = format_prediction_label(analysis.smoothed_label)
         label_color = (92, 224, 160) if analysis.hand_detected else (130, 140, 150)
-        cv2.putText(frame, current_label, (26, 76), cv2.FONT_HERSHEY_SIMPLEX, 2.0, label_color, 4, cv2.LINE_AA)
-        cv2.putText(
-            frame,
-            f"Confidence {analysis.confidence:.0%}" if analysis.hand_detected else "No hand detected",
-            (28, 102),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.72,
-            (232, 238, 242),
-            2,
-            cv2.LINE_AA,
-        )
+        cv2.putText(canvas, current_label, (26, 72), cv2.FONT_HERSHEY_SIMPLEX, 2.0, label_color, 4, cv2.LINE_AA)
+        conf_text = f"Confidence {analysis.confidence:.0%}" if analysis.hand_detected else "No hand detected"
+        cv2.putText(canvas, conf_text, (28, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (200, 210, 220), 2, cv2.LINE_AA)
+        cv2.putText(canvas, self.message, (260, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (236, 242, 246), 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"FPS {self.fps_display:.0f}", (canvas_w - 120, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 210, 220), 2, cv2.LINE_AA)
+        cv2.line(canvas, (0, TOP_BAR_H - 1), (canvas_w, TOP_BAR_H - 1), (55, 65, 78), 1)
 
-        zone_x0 = int(width * (1.0 - SEND_ZONE_RATIO))
-        zone_color = (31, 191, 117) if in_send_zone else (45, 76, 107)
-        zone_overlay = frame.copy()
-        cv2.rectangle(zone_overlay, (zone_x0, 0), (width, height), zone_color, -1)
-        cv2.addWeighted(zone_overlay, 0.18 if in_send_zone else 0.10, frame, 0.82 if in_send_zone else 0.90, 0, frame)
-        cv2.line(frame, (zone_x0, 0), (zone_x0, height), (225, 240, 248), 2)
-        cv2.putText(frame, "SEND", (zone_x0 + 22, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3, cv2.LINE_AA)
-        cv2.putText(frame, "Hold hand here", (zone_x0 + 12, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (245, 248, 252), 2, cv2.LINE_AA)
+        # ── SEND PANEL (right strip beside camera) ───────────────────────────
+        send_x0 = cam_w
+        zone_color = (31, 191, 117) if in_send_zone else (30, 52, 78)
+        cv2.rectangle(canvas, (send_x0, TOP_BAR_H), (canvas_w, TOP_BAR_H + cam_h), zone_color, -1)
+        cv2.line(canvas, (send_x0, TOP_BAR_H), (send_x0, TOP_BAR_H + cam_h), (225, 240, 248), 2)
+        send_cx = send_x0 + SIDE_PANEL_W // 2
+        cv2.putText(canvas, "SEND", (send_cx - 46, TOP_BAR_H + 55), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(canvas, "Move hand to", (send_cx - 58, TOP_BAR_H + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (220, 235, 245), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "right edge", (send_cx - 44, TOP_BAR_H + 113), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (220, 235, 245), 2, cv2.LINE_AA)
+        # Vertical dwell progress bar
+        vbar_x = send_cx - 12
+        vbar_y0 = TOP_BAR_H + 145
+        vbar_h = cam_h - 185
+        cv2.rectangle(canvas, (vbar_x, vbar_y0), (vbar_x + 24, vbar_y0 + vbar_h), (20, 35, 50), -1)
+        if in_send_zone and self.send_progress > 0:
+            filled = int(vbar_h * self.send_progress)
+            cv2.rectangle(canvas, (vbar_x, vbar_y0 + vbar_h - filled), (vbar_x + 24, vbar_y0 + vbar_h), (255, 180, 84), -1)
 
-        bottom_y0 = height - 170
-        bottom_panel = frame.copy()
-        cv2.rectangle(bottom_panel, (0, bottom_y0), (width, height), (4, 12, 20), -1)
-        cv2.addWeighted(bottom_panel, 0.75, frame, 0.25, 0, frame)
+        # ── BOTTOM BAR ───────────────────────────────────────────────────────
+        by0 = TOP_BAR_H + cam_h
+        cv2.line(canvas, (0, by0), (canvas_w, by0), (55, 65, 78), 1)
 
+        # Sentence (left)
         sentence_text = self.composer.buffer if self.composer.buffer else "Start fingerspelling to build a sentence"
-        sentence_lines = wrap_text(sentence_text, 42)
-        cv2.putText(frame, "Sentence", (24, bottom_y0 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (164, 184, 198), 2, cv2.LINE_AA)
-        for index, line in enumerate(sentence_lines[:3]):
-            cv2.putText(frame, line, (24, bottom_y0 + 62 + index * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (238, 244, 247), 2, cv2.LINE_AA)
+        sentence_lines = wrap_text(sentence_text, 52)
+        cv2.putText(canvas, "Sentence", (24, by0 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (164, 184, 198), 2, cv2.LINE_AA)
+        for idx, line in enumerate(sentence_lines[:2]):
+            cv2.putText(canvas, line, (24, by0 + 56 + idx * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.80, (238, 244, 247), 2, cv2.LINE_AA)
 
-        status_text, hold_text = self._build_status_text(analysis, compose_result, in_send_zone)
-        cv2.putText(frame, status_text, (24, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 180, 84), 2, cv2.LINE_AA)
-        cv2.putText(frame, hold_text, (410, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (170, 220, 190), 2, cv2.LINE_AA)
+        # Status text + hold progress bar
+        status_text, _ = self._build_status_text(analysis, compose_result, in_send_zone)
+        cv2.putText(canvas, status_text, (24, by0 + 126), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 180, 84), 2, cv2.LINE_AA)
+        progress = compose_result["progress"] if not in_send_zone else 0.0
+        hbar_y = by0 + BOTTOM_BAR_H - 16
+        cv2.rectangle(canvas, (24, hbar_y - 10), (344, hbar_y), (42, 54, 66), -1)
+        cv2.rectangle(canvas, (24, hbar_y - 10), (24 + int(320 * progress), hbar_y), (31, 191, 117), -1)
 
-        top3_x = 520
-        cv2.putText(frame, "Top 3", (top3_x, bottom_y0 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (164, 184, 198), 2, cv2.LINE_AA)
+        # Top 3 (right of bottom bar)
+        top3_x = cam_w - 240
+        cv2.putText(canvas, "Top 3", (top3_x, by0 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (164, 184, 198), 2, cv2.LINE_AA)
         for rank, (raw_label, probability) in enumerate(analysis.top3[:3]):
-            label = format_prediction_label(normalize_prediction_label(raw_label))
-            color = (92, 224, 160) if rank == 0 else (220, 228, 234)
-            cv2.putText(
-                frame,
-                f"{label} {probability:.0%}",
-                (top3_x, bottom_y0 + 62 + rank * 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.72,
-                color,
-                2,
-                cv2.LINE_AA,
-            )
+            lbl = format_prediction_label(normalize_prediction_label(raw_label))
+            color = (92, 224, 160) if rank == 0 else (200, 210, 220)
+            cv2.putText(canvas, f"{lbl} {probability:.0%}", (top3_x, by0 + 56 + rank * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.68, color, 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"Last sent: {self.composer.last_sent or '--'}", (top3_x, by0 + BOTTOM_BAR_H - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (182, 196, 206), 2, cv2.LINE_AA)
 
-        cv2.putText(frame, f"Last sent: {self.composer.last_sent or '--'}", (top3_x, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (182, 196, 206), 2, cv2.LINE_AA)
-
-        progress = self.send_progress if in_send_zone else compose_result["progress"]
-        progress_color = (255, 180, 84) if in_send_zone else (31, 191, 117)
-        bar_x0 = width - 360
-        bar_y0 = height - 42
-        bar_width = 300
-        cv2.rectangle(frame, (bar_x0, bar_y0), (bar_x0 + bar_width, bar_y0 + 14), (42, 54, 66), -1)
-        cv2.rectangle(frame, (bar_x0, bar_y0), (bar_x0 + int(bar_width * progress), bar_y0 + 14), progress_color, -1)
-        cv2.putText(frame, f"FPS {self.fps_display:.0f}", (width - 132, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (236, 242, 246), 2, cv2.LINE_AA)
-        cv2.putText(frame, self.message, (width - 430, bottom_y0 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (236, 242, 246), 2, cv2.LINE_AA)
-        return frame
+        return canvas
 
     def _build_status_text(self, analysis, compose_result, in_send_zone):
         if in_send_zone:

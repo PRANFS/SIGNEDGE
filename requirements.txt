@@ -2,3 +2,4 @@ numpy<2
 mediapipe
 opencv-python
 tflite-runtime
+piper-tts
