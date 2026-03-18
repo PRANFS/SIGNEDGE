@@ -45,8 +45,16 @@ SEND_DWELL_SECONDS = 1.75
 SEND_ZONE_RATIO = 0.22
 TTS_RATE = 165
 PIPER_VOICE = "en_US-amy-medium"
+STT_ENABLED = True
+STT_MODEL_DIRNAME = "moonshine-small-streaming"
+STT_MODEL_ARCH = 4  # ModelArch.SMALL_STREAMING
+STT_SAMPLE_RATE = 16000
+STT_BLOCK_SIZE = 4000
+STT_UPDATE_INTERVAL = 0.35
+STT_TRANSCRIPT_MAX_CHARS = 64
+STT_TRANSCRIPT_MAX_LINES = 2
 
-TOP_BAR_H = 110
+TOP_BAR_H = 150
 BOTTOM_BAR_H = 160
 SIDE_PANEL_W = 220
 PANEL_BG = (18, 24, 32)
@@ -381,6 +389,93 @@ class OfflineSpeaker:
         )
 
 
+class OfflineSTTEngine:
+    def __init__(self, model_path, enabled=True):
+        self.event_queue = queue.Queue()
+        self.enabled = enabled
+        self.mic_transcriber = None
+        self.listener = None
+
+        if not self.enabled:
+            self._publish("error", "Speech-to-text disabled")
+            return
+
+        model_path = Path(model_path)
+        required_files = [
+            model_path / "encoder.ort",
+            model_path / "decoder_kv.ort",
+            model_path / "cross_kv.ort",
+            model_path / "adapter.ort",
+            model_path / "frontend.ort",
+            model_path / "streaming_config.json",
+            model_path / "tokenizer.bin",
+        ]
+        missing_files = [path.name for path in required_files if not path.exists()]
+        if missing_files:
+            self.enabled = False
+            self._publish(
+                "error",
+                (
+                    "Moonshine model missing: "
+                    + ", ".join(missing_files)
+                    + f" (expected in {model_path})"
+                ),
+            )
+            return
+
+        try:
+            from moonshine_voice import MicTranscriber, ModelArch, TranscriptEventListener  # type: ignore[import]
+
+            class STTListener(TranscriptEventListener):
+                def __init__(self, publish):
+                    self.publish = publish
+
+                def on_line_text_changed(self, event):
+                    text = event.line.text.strip()
+                    if text:
+                        self.publish("partial", text)
+
+                def on_line_completed(self, event):
+                    text = event.line.text.strip()
+                    if text:
+                        self.publish("final", text)
+
+                def on_error(self, event):
+                    self.publish("error", f"Moonshine error: {event.error}")
+
+            self.mic_transcriber = MicTranscriber(
+                model_path=str(model_path),
+                model_arch=ModelArch(STT_MODEL_ARCH),
+                update_interval=STT_UPDATE_INTERVAL,
+                samplerate=STT_SAMPLE_RATE,
+                blocksize=STT_BLOCK_SIZE,
+                channels=1,
+            )
+
+            self.listener = STTListener(self._publish)
+            self.mic_transcriber.add_listener(self.listener)
+            self.mic_transcriber.start()
+            self._publish("ready", "STT ready (Moonshine small streaming)")
+        except Exception as exc:
+            self.enabled = False
+            self._publish("error", f"STT unavailable: {exc}")
+
+    def _publish(self, event_type, message):
+        self.event_queue.put((event_type, message))
+
+    def stop(self):
+        if self.mic_transcriber is not None:
+            try:
+                self.mic_transcriber.stop()
+            except Exception:
+                pass
+            try:
+                self.mic_transcriber.close()
+            except Exception:
+                pass
+            self.mic_transcriber = None
+
+
 class SignEdgeApp:
     def __init__(self):
         self.project_dir = Path(__file__).resolve().parent
@@ -393,7 +488,14 @@ class SignEdgeApp:
             release_seconds=RELEASE_SECONDS,
         )
         self.speaker = OfflineSpeaker()
+        self.stt_engine = OfflineSTTEngine(
+            model_path=self.project_dir / STT_MODEL_DIRNAME,
+            enabled=STT_ENABLED,
+        )
         self.pred_history = deque(maxlen=SMOOTH_WINDOW)
+        self.stt_partial = ""
+        self.stt_lines = deque(maxlen=STT_TRANSCRIPT_MAX_LINES)
+        self.stt_status = "Speech-to-text starting"
         self.send_dwell_started = None
         self.send_progress = 0.0
         self.is_speaking = False
@@ -431,6 +533,7 @@ class SignEdgeApp:
         try:
             while True:
                 self._drain_speech_events()
+                self._drain_stt_events()
                 analysis = self._process_frame()
                 now = time.perf_counter()
                 in_send_zone = bool(
@@ -534,8 +637,14 @@ class SignEdgeApp:
         cv2.putText(canvas, current_label, (26, 72), cv2.FONT_HERSHEY_SIMPLEX, 2.0, label_color, 4, cv2.LINE_AA)
         conf_text = f"Confidence {analysis.confidence:.0%}" if analysis.hand_detected else "No hand detected"
         cv2.putText(canvas, conf_text, (28, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (200, 210, 220), 2, cv2.LINE_AA)
-        cv2.putText(canvas, self.message, (260, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (236, 242, 246), 2, cv2.LINE_AA)
+        cv2.putText(canvas, self.message, (260, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (236, 242, 246), 2, cv2.LINE_AA)
         cv2.putText(canvas, f"FPS {self.fps_display:.0f}", (canvas_w - 120, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 210, 220), 2, cv2.LINE_AA)
+
+        stt_lines = self._get_stt_render_lines()
+        cv2.putText(canvas, f"Speech: {self.stt_status}", (260, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (172, 190, 206), 2, cv2.LINE_AA)
+        for idx, line in enumerate(stt_lines):
+            cv2.putText(canvas, line, (260, 101 + idx * 24), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (122, 232, 176), 2, cv2.LINE_AA)
+
         cv2.line(canvas, (0, TOP_BAR_H - 1), (canvas_w, TOP_BAR_H - 1), (55, 65, 78), 1)
 
         # ── SEND PANEL (right strip beside camera) ───────────────────────────
@@ -650,6 +759,34 @@ class SignEdgeApp:
                 self.is_speaking = False
                 self.message = message
 
+    def _drain_stt_events(self):
+        while True:
+            try:
+                event_type, message = self.stt_engine.event_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if event_type == "ready":
+                self.stt_status = message
+            elif event_type == "partial":
+                self.stt_partial = message
+            elif event_type == "final":
+                self.stt_partial = ""
+                for line in wrap_text(message, STT_TRANSCRIPT_MAX_CHARS):
+                    self.stt_lines.append(line)
+            elif event_type == "error":
+                self.stt_status = message
+
+    def _get_stt_render_lines(self):
+        if self.stt_partial:
+            partial_lines = wrap_text(self.stt_partial, STT_TRANSCRIPT_MAX_CHARS)
+            return partial_lines[-STT_TRANSCRIPT_MAX_LINES:]
+
+        if self.stt_lines:
+            return list(self.stt_lines)[-STT_TRANSCRIPT_MAX_LINES:]
+
+        return ["Listening..."]
+
     def close(self):
         try:
             if self.capture is not None:
@@ -662,6 +799,9 @@ class SignEdgeApp:
                 self.hands.close()
         finally:
             self.hands = None
+
+        if self.stt_engine is not None:
+            self.stt_engine.stop()
 
         self.speaker.stop()
         cv2.destroyAllWindows()
