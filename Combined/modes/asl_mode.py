@@ -211,6 +211,17 @@ class ASLMode:
         self.send_dwell_started = None
         self.send_progress = 0.0
         self.message = "ASL mode active"
+        self.last_metrics = {
+            "hand_detected": False,
+            "label": None,
+            "confidence": 0.0,
+            "top3": [],
+            "buffer": "",
+            "hold_progress": 0.0,
+            "in_send_zone": False,
+            "sent_text": None,
+            "message": self.message,
+        }
 
         self.mp_hands = mp.solutions.hands
         self.mp_draw = mp.solutions.drawing_utils
@@ -233,6 +244,18 @@ class ASLMode:
             for i, line in enumerate(self._predictor_error.split(". ")):
                 cv2.putText(frame, line, (20, 100 + i * 36),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220, 220, 220), 2, cv2.LINE_AA)
+            self.last_metrics = {
+                "hand_detected": False,
+                "label": None,
+                "confidence": 0.0,
+                "top3": [],
+                "buffer": self.composer.buffer,
+                "hold_progress": 0.0,
+                "in_send_zone": False,
+                "sent_text": None,
+                "message": self._predictor_error,
+                "error": self._predictor_error,
+            }
             return frame, None, self._predictor_error
 
         # BUG FIX: was a hard raise RuntimeError that crashed the app.
@@ -242,6 +265,18 @@ class ASLMode:
             frame = self._BLANK.copy()
             cv2.putText(frame, "Camera unavailable", (20, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 80, 220), 2, cv2.LINE_AA)
+            self.last_metrics = {
+                "hand_detected": False,
+                "label": None,
+                "confidence": 0.0,
+                "top3": [],
+                "buffer": self.composer.buffer,
+                "hold_progress": 0.0,
+                "in_send_zone": False,
+                "sent_text": None,
+                "message": "Camera unavailable",
+                "error": "Camera unavailable",
+            }
             return frame, None, "Camera unavailable"
 
         ok, frame = self.capture.read()
@@ -249,6 +284,18 @@ class ASLMode:
             # Try to re-open on the next tick instead of crashing
             self.capture.release()
             self.capture = cv2.VideoCapture(CAMERA_INDEX)
+            self.last_metrics = {
+                "hand_detected": False,
+                "label": None,
+                "confidence": 0.0,
+                "top3": [],
+                "buffer": self.composer.buffer,
+                "hold_progress": 0.0,
+                "in_send_zone": False,
+                "sent_text": None,
+                "message": "Camera read failed — retrying…",
+                "error": "Camera read failed",
+            }
             return self._BLANK.copy(), None, "Camera read failed — retrying…"
 
         frame = cv2.flip(frame, 1)
@@ -325,6 +372,18 @@ class ASLMode:
             self.message = f"Sent: {sent_text}" if sent_text else "Nothing to send"
 
         rendered = self._decorate_frame(analysis, compose_result, in_send_zone)
+        self.last_metrics = {
+            "hand_detected": analysis.hand_detected,
+            "label": analysis.smoothed_label,
+            "confidence": analysis.confidence,
+            "top3": analysis.top3,
+            "buffer": self.composer.buffer,
+            "hold_progress": compose_result["progress"],
+            "in_send_zone": in_send_zone,
+            "send_progress": self.send_progress,
+            "sent_text": sent_text,
+            "message": self.message,
+        }
         return rendered, sent_text, self.message
 
     def _update_send_dwell(self, now):

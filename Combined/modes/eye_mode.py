@@ -270,9 +270,23 @@ class EyeMode:
 
         self.cursor_x = CAMERA_WIDTH / 2
         self.cursor_y = CAMERA_HEIGHT / 2
+        self.blink_click_count = 0
+        self.last_hovered_key = None
         self.keys = []
         self._keys_frame_size = (0, 0)   # track frame size so keyboard rebuilds if needed
         self.message = "Eye mode active"
+        self.last_metrics = {
+            "state": self.state,
+            "raw_x": None,
+            "raw_y": None,
+            "cursor_x": self.cursor_x,
+            "cursor_y": self.cursor_y,
+            "is_clicking": False,
+            "blink_click_count": self.blink_click_count,
+            "hovered_key": None,
+            "text_length": 0,
+            "message": self.message,
+        }
 
     # ------------------------------------------------------------------
     def _start_calibration(self):
@@ -303,6 +317,18 @@ class EyeMode:
                     self.state = "TYPING"
                     self.message = "Eye calibration done — start typing"
             rendered = self._render_calibration(frame)
+            self.last_metrics = {
+                "state": self.state,
+                "raw_x": raw_x,
+                "raw_y": raw_y,
+                "cursor_x": self.cursor_x,
+                "cursor_y": self.cursor_y,
+                "is_clicking": is_clicking,
+                "blink_click_count": self.blink_click_count,
+                "hovered_key": None,
+                "text_length": len(self.current_text),
+                "message": self.message,
+            }
             return rendered, None, self.message
 
         if raw_x is not None and raw_y is not None:
@@ -324,10 +350,25 @@ class EyeMode:
                 self.cursor_y = (EYE_CURSOR_ALPHA * target_y) + ((1 - EYE_CURSOR_ALPHA) * self.cursor_y)
 
         hovered_char = self._get_hovered_key()
+        self.last_hovered_key = hovered_char
         if is_clicking and hovered_char:
+            self.blink_click_count += 1
             spoken_text = self._process_key_click(hovered_char)
 
         rendered = self._render_typing(frame, hovered_char)
+        self.last_metrics = {
+            "state": self.state,
+            "raw_x": raw_x,
+            "raw_y": raw_y,
+            "cursor_x": self.cursor_x,
+            "cursor_y": self.cursor_y,
+            "is_clicking": is_clicking,
+            "blink_click_count": self.blink_click_count,
+            "hovered_key": hovered_char,
+            "text_length": len(self.current_text),
+            "message": self.message,
+            "spoken_text": spoken_text,
+        }
         return rendered, spoken_text, self.message
 
     # ── Calibration screen ──────────────────────────────────────────────

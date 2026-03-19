@@ -10,6 +10,8 @@ diskcache==5.6.3
 flatbuffers==20181003210633
 fonttools==4.61.1
 Jinja2==3.1.6
+paho-mqtt==2.1.0
+Flask==3.1.1
 jax==0.7.1
 jaxlib==0.7.1
 kiwisolver==1.4.9

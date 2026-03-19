@@ -1,13 +1,23 @@
 import queue
 import tkinter as tk
 from tkinter import ttk
+import time
 
 import cv2
 from PIL import Image, ImageTk
 
 from core.audio_stt import OfflineSTTEngine
 from core.audio_tts import OfflineSpeaker
-from core.config import APP_FPS, WINDOW_TITLE
+from core.config import (
+    APP_FPS,
+    MQTT_BASE_TOPIC,
+    MQTT_BROKER_HOST,
+    MQTT_BROKER_PORT,
+    MQTT_ENABLED,
+    MQTT_QOS,
+    WINDOW_TITLE,
+)
+from core.mqtt_publisher import MQTTPublisher
 from core.transcript_store import TranscriptStore
 from modes.asl_mode import ASLMode
 from modes.eye_mode import EyeMode
@@ -29,16 +39,33 @@ class UnifiedSignEdgeApp:
         self.mode = "BOOT_GATE"
         self.mode_message = "Initializing"
         self.stt_partial = ""
+        self._session_started_at = time.time()
+        self._tick_count = 0
+        self._telemetry_every_n_ticks = 5
 
         self.gate_mode = StartupGate()
         self.eye_mode = None
         self.asl_mode = None
+
+        self.publisher = MQTTPublisher(
+            host=MQTT_BROKER_HOST,
+            port=MQTT_BROKER_PORT,
+            base_topic=MQTT_BASE_TOPIC,
+            qos=MQTT_QOS,
+            enabled=MQTT_ENABLED,
+        )
 
         self._current_image = None
 
         self._build_ui()
         self._bind_keys()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _publish(self, topic_suffix, payload):
+        try:
+            self.publisher.publish(topic_suffix, payload)
+        except Exception:
+            pass
 
     def _maximize_window(self):
         try:
@@ -103,11 +130,20 @@ class UnifiedSignEdgeApp:
 
     def _restart_gate(self):
         """Return to the startup gate so the user can switch between eye / ASL mode."""
+        old_mode = self.mode
         self._close_current_mode()
         self.mode = "BOOT_GATE"
         self.gate_mode = StartupGate()
         self.mode_message = "Mode selection restarted"
         self.transcript.append("SYS", "Mode selection restarted (Escape pressed)")
+        self._publish(
+            "mode/switch",
+            {
+                "old_mode": old_mode,
+                "new_mode": "BOOT_GATE",
+                "reason": "escape_pressed",
+            },
+        )
 
     def start(self):
         self.transcript.append(
@@ -116,21 +152,39 @@ class UnifiedSignEdgeApp:
             "Press Escape at any time to restart mode selection.",
         )
         self._tick()
+        self._publish(
+            "system/start",
+            {
+                "mode": self.mode,
+                "message": "app_started",
+                "mqtt_connected": self.publisher.connected,
+            },
+        )
         self.root.mainloop()
 
     def _switch_to_eye_mode(self):
+        old_mode = self.mode
         self._close_current_mode()
         self.mode = "EYE"
         self.eye_mode = EyeMode()
         self.mode_message = "Eye mode active"
         self.transcript.append("SYS", "Switched to eye tracking mode")
+        self._publish(
+            "mode/switch",
+            {"old_mode": old_mode, "new_mode": "EYE", "message": self.mode_message},
+        )
 
     def _switch_to_asl_mode(self):
+        old_mode = self.mode
         self._close_current_mode()
         self.mode = "ASL"
         self.asl_mode = ASLMode()
         self.mode_message = "ASL mode active"
         self.transcript.append("SYS", "Switched to ASL finger recognition mode")
+        self._publish(
+            "mode/switch",
+            {"old_mode": old_mode, "new_mode": "ASL", "message": self.mode_message},
+        )
 
     def _close_current_mode(self):
         for attr in ("gate_mode", "eye_mode", "asl_mode"):
@@ -150,11 +204,14 @@ class UnifiedSignEdgeApp:
                 break
             if event_type == "partial":
                 self.stt_partial = message
+                self._publish("stt/partial", {"text": message})
             elif event_type == "final":
                 self.stt_partial = ""
                 self.transcript.append("STT", message)
+                self._publish("stt/final", {"text": message})
             elif event_type in {"ready", "error"}:
                 self.transcript.append("SYS", message)
+                self._publish("stt/status", {"event": event_type, "message": message})
 
     def _drain_tts_events(self):
         while True:
@@ -166,6 +223,7 @@ class UnifiedSignEdgeApp:
             # "status" events (e.g. Piper fallback notice) were silently dropped.
             if event_type in {"ready", "error", "status"}:
                 self.transcript.append("SYS", message)
+                self._publish("tts/status", {"event": event_type, "message": message})
 
     def _handle_mode_tick(self):
         if self.mode == "BOOT_GATE" and self.gate_mode is not None:
@@ -210,6 +268,7 @@ class UnifiedSignEdgeApp:
         self.video_label.configure(image=self._current_image)
 
     def _tick(self):
+        tick_started = time.perf_counter()
         self._drain_stt_events()
         self._drain_tts_events()
 
@@ -230,13 +289,43 @@ class UnifiedSignEdgeApp:
 
         self.chat_panel.refresh(self.transcript.snapshot())
 
+        self._tick_count += 1
+        if self._tick_count % self._telemetry_every_n_ticks == 0:
+            loop_ms = (time.perf_counter() - tick_started) * 1000.0
+            self._publish(
+                "system/heartbeat",
+                {
+                    "mode": self.mode,
+                    "mode_message": self.mode_message,
+                    "stt_partial": self.stt_partial,
+                    "uptime_s": time.time() - self._session_started_at,
+                    "loop_ms": loop_ms,
+                    "fps_target": APP_FPS,
+                    "mqtt_connected": self.publisher.connected,
+                },
+            )
+
+            if self.mode == "ASL" and self.asl_mode is not None:
+                self._publish("asl/metrics", self.asl_mode.last_metrics)
+            elif self.mode == "EYE" and self.eye_mode is not None:
+                self._publish("eye/metrics", self.eye_mode.last_metrics)
+
         interval = int(1000 / APP_FPS)
         self.root.after(interval, self._tick)
 
     def close(self):
+        self._publish(
+            "system/stop",
+            {
+                "mode": self.mode,
+                "message": "app_stopping",
+                "uptime_s": time.time() - self._session_started_at,
+            },
+        )
         self._close_current_mode()
         self.stt_engine.stop()
         self.speaker.stop()
+        self.publisher.stop()
         self.root.destroy()
 
 
