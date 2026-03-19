@@ -1,7 +1,6 @@
 import tkinter as tk
 from tkinter import ttk
 
-
 class ChatPanel:
     def __init__(self, parent):
         self.container = ttk.Frame(parent)
@@ -15,7 +14,7 @@ class ChatPanel:
         header.pack(anchor="w", padx=8, pady=(8, 4))
 
         text_frame = ttk.Frame(self.container)
-        text_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        text_frame.pack(fill="both", expand=True, padx=8, pady=(0, 16))
 
         self.text = tk.Text(
             text_frame,
@@ -26,11 +25,21 @@ class ChatPanel:
             fg="#f3f4f6",
             insertbackground="#f3f4f6",
         )
-        self.scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self.text.yview)
+        self.scrollbar = tk.Scrollbar(
+            text_frame,
+            orient="vertical",
+            command=self.text.yview,
+            width=18,
+            bg="#2b2f36",
+            activebackground="#4b5563",
+            troughcolor="#111317",
+            relief="flat",
+            borderwidth=0,
+        )
         self.text.configure(yscrollcommand=self.scrollbar.set)
 
         self.text.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
+        self.scrollbar.pack(side="right", fill="y", pady=(0, 12))
 
         # Colour scheme for each source type
         self.text.tag_configure("STT",      foreground="#7ee787")          # green   — microphone

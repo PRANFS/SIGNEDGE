@@ -56,20 +56,26 @@ class UnifiedSignEdgeApp:
         self.root.geometry(f"{width}x{height}+0+0")
 
     def _build_ui(self):
-        # 70 % video | 30 % chat
-        self.root.columnconfigure(0, weight=7)
-        self.root.columnconfigure(1, weight=3)
+        # Side-by-side layout: left spacer | main | thin chat
+        # Effective main/chat split is ~82/18 for usable content.
+        # Spacer keeps the main pane visually near center.
+        self.root.columnconfigure(0, weight=14)
+        self.root.columnconfigure(1, weight=82)
+        self.root.columnconfigure(2, weight=18)
         self.root.rowconfigure(0, weight=1)
 
+        self.left_spacer = tk.Frame(self.root, bg="#0d0f12")
+        self.left_spacer.grid(row=0, column=0, sticky="nsew")
+
         # ── LEFT: thin status bar + video ──
-        left_frame = tk.Frame(self.root, bg="#0d0f12")
-        left_frame.grid(row=0, column=0, sticky="nsew", padx=(6, 3), pady=6)
-        left_frame.columnconfigure(0, weight=1)
-        left_frame.rowconfigure(1, weight=1)
+        self.left_frame = tk.Frame(self.root, bg="#0d0f12")
+        self.left_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 4), pady=6)
+        self.left_frame.columnconfigure(0, weight=1)
+        self.left_frame.rowconfigure(1, weight=1)
 
         self.status_var = tk.StringVar(value="Starting…")
         status_lbl = tk.Label(
-            left_frame,
+            self.left_frame,
             textvariable=self.status_var,
             font=("Segoe UI", 10),
             bg="#0d0f12",
@@ -79,16 +85,17 @@ class UnifiedSignEdgeApp:
         status_lbl.grid(row=0, column=0, sticky="ew", padx=4, pady=(2, 2))
 
         # Video fills all remaining space
-        self.video_label = tk.Label(left_frame, bg="#0d0f12", anchor="center")
+        self.video_label = tk.Label(self.left_frame, bg="#0d0f12", anchor="center")
         self.video_label.grid(row=1, column=0, sticky="nsew")
 
         # ── RIGHT: chat panel ──
-        right_frame = tk.Frame(self.root, bg="#0d0f12")
-        right_frame.grid(row=0, column=1, sticky="nsew", padx=(3, 6), pady=6)
-        right_frame.columnconfigure(0, weight=1)
-        right_frame.rowconfigure(0, weight=1)
+        self.right_frame = tk.Frame(self.root, bg="#0d0f12")
+        self.right_frame.grid(row=0, column=2, sticky="nsew", padx=(4, 6), pady=6)
+        self.right_frame.columnconfigure(0, weight=1)
+        self.right_frame.rowconfigure(0, weight=1)
+        self.right_frame.grid_propagate(False)
 
-        self.chat_panel = ChatPanel(right_frame)
+        self.chat_panel = ChatPanel(self.right_frame)
 
     def _bind_keys(self):
         # Press Escape at any time to restart mode selection
@@ -195,24 +202,9 @@ class UnifiedSignEdgeApp:
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(frame_rgb)
 
-        # BUG FIX 1: image.thumbnail() only *shrinks* — it never upscales a
-        # small frame to fill a larger pane.  Use resize() with a proper scale.
-        # BUG FIX 2: winfo_width/height return 1 before the window is fully
-        # drawn, giving a 320×240 floor that causes wrong scaling on the first
-        # few frames.  Use the screen geometry as a more reliable lower bound.
-        pane_w = self.video_label.winfo_width()
-        pane_h = self.video_label.winfo_height()
-        if pane_w < 100 or pane_h < 100:
-            # Window not yet drawn — use half the screen as a safe default
-            pane_w = self.root.winfo_screenwidth() // 2
-            pane_h = self.root.winfo_screenheight()
-
-        img_w, img_h = image.size
-        if img_w > 0 and img_h > 0:
-            scale = min(pane_w / img_w, pane_h / img_h)
-            new_w = max(1, int(img_w * scale))
-            new_h = max(1, int(img_h * scale))
-            image = image.resize((new_w, new_h), Image.LANCZOS)
+        pane_w = max(320, self.video_label.winfo_width())
+        pane_h = max(240, self.video_label.winfo_height())
+        image.thumbnail((pane_w, pane_h))
 
         self._current_image = ImageTk.PhotoImage(image=image)
         self.video_label.configure(image=self._current_image)
