@@ -21,8 +21,14 @@ class OfflineSpeaker:
 
         engine_name, piper_issue = self._load_piper()
         if engine_name is None:
-            self._publish("status", f"[TTS] Piper not loaded: {piper_issue}; fallback to espeak")
-            engine_name = self._load_espeak()
+            # BUG FIX: was published as "status" which _drain_tts_events ignores.
+            # Changed to "error" so the fallback notice actually appears in the transcript.
+            self._publish("error", f"[TTS] Piper not loaded ({piper_issue}); falling back to espeak")
+            try:
+                engine_name = self._load_espeak()
+            except RuntimeError as exc:
+                self._publish("error", f"[TTS] No TTS engine available: {exc}")
+                engine_name = "none"
 
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
@@ -60,7 +66,7 @@ class OfflineSpeaker:
 
     def stop(self):
         self.stop_event.set()
-        self.command_queue.put(None)
+        self.command_queue.put(None)  # unblock the worker if it is waiting
         self.thread.join(timeout=2.0)
 
     def _worker(self):
@@ -70,12 +76,13 @@ class OfflineSpeaker:
                 break
 
             try:
-                self._publish("status", f"Speaking: {text}")
                 if self.piper_voice is not None:
                     self._speak_piper(text)
-                else:
+                elif self.tts_command is not None:
                     self._speak_espeak(text)
-                self._publish("spoken", text)
+                else:
+                    # No engine loaded — silently skip so the app doesn't crash
+                    pass
             except Exception as exc:
                 self._publish("error", f"Speech failed: {exc}")
 
@@ -87,18 +94,15 @@ class OfflineSpeaker:
         sample_rate = chunks[0].sample_rate
         channels = chunks[0].sample_channels
 
+        # Prefer aplay (Linux, Raspberry Pi)
         if self.aplay_command:
             proc = subprocess.Popen(
                 [
                     self.aplay_command,
-                    "-r",
-                    str(sample_rate),
-                    "-f",
-                    "S16_LE",
-                    "-c",
-                    str(channels),
-                    "-t",
-                    "raw",
+                    "-r", str(sample_rate),
+                    "-f", "S16_LE",
+                    "-c", str(channels),
+                    "-t", "raw",
                     "-",
                 ],
                 stdin=subprocess.PIPE,
@@ -111,6 +115,7 @@ class OfflineSpeaker:
             proc.wait()
             return
 
+        # Fallback: write a temp WAV and play with ffplay
         ffplay = shutil.which("ffplay")
         if ffplay:
             buf = io.BytesIO()
@@ -132,11 +137,17 @@ class OfflineSpeaker:
                 check=False,
             )
             Path(tmp_path).unlink(missing_ok=True)
+            return
+
+        # BUG FIX: previously silently did nothing if neither aplay nor ffplay exist.
+        self._publish("error", "[TTS] No audio playback tool found (need aplay or ffplay)")
 
     def _speak_espeak(self, text):
-        subprocess.run(
+        result = subprocess.run(
             [self.tts_command, "-s", "165", text],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             check=False,
         )
+        if result.returncode != 0:
+            self._publish("error", f"espeak failed: {result.stderr.decode(errors='replace').strip()}")

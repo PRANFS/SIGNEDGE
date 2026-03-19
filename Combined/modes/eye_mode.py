@@ -138,7 +138,6 @@ class LLMPredictor:
             sentence = self.request_queue.get()
             if sentence is None:
                 break
-
             prompt = (
                 "<|system|>\n"
                 "You are an AAC typing assistant. Provide ONLY the next 1 to 2 words to complete the sentence."
@@ -171,9 +170,15 @@ class LLMPredictor:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Trie
+# ---------------------------------------------------------------------------
+
 class TrieNode:
+    __slots__ = ("children", "is_end_of_word", "frequency")
+
     def __init__(self):
-        self.children = {}
+        self.children: dict = {}
         self.is_end_of_word = False
         self.frequency = 0
 
@@ -214,14 +219,20 @@ class FrequencyTrie:
             if char not in node.children:
                 return []
             node = node.children[char]
-        return self._collect(node, prefix)
+        return self._collect_iterative(node, prefix)
 
-    def _collect(self, node, prefix):
+    # BUG FIX: original _collect() was recursive — deep tries (long words /
+    # large dictionaries) hit Python's default ~1000 recursion limit.
+    # Replaced with an explicit stack so depth is unbounded.
+    def _collect_iterative(self, start_node, start_prefix):
         results = []
-        if node.is_end_of_word:
-            results.append((prefix, node.frequency))
-        for char, child in node.children.items():
-            results.extend(self._collect(child, prefix + char))
+        stack = [(start_node, start_prefix)]
+        while stack:
+            node, prefix = stack.pop()
+            if node.is_end_of_word:
+                results.append((prefix, node.frequency))
+            for char, child in node.children.items():
+                stack.append((child, prefix + char))
         return results
 
     def get_top_k_predictions(self, prefix, k=4):
@@ -231,6 +242,10 @@ class FrequencyTrie:
         matches.sort(key=lambda item: item[1], reverse=True)
         return [word for word, _ in matches[:k]]
 
+
+# ---------------------------------------------------------------------------
+# EyeMode
+# ---------------------------------------------------------------------------
 
 class EyeMode:
     def __init__(self):
@@ -247,10 +262,7 @@ class EyeMode:
         self.llm = LLMPredictor(llm_path)
         self.predictor = FrequencyTrie(str(EYE_FREQUENCIES_FILE))
 
-        self.state = "CALIBRATING"
-        self.calib_points = ["TOP-LEFT", "TOP-RIGHT", "BOTTOM-LEFT", "BOTTOM-RIGHT"]
-        self.calib_index = 0
-        self.calib_data = {"x_min": 1.0, "x_max": 0.0, "y_min": 1.0, "y_max": 0.0}
+        self._start_calibration()
 
         self.current_text = ""
         self.current_word = ""
@@ -259,8 +271,17 @@ class EyeMode:
         self.cursor_x = CAMERA_WIDTH / 2
         self.cursor_y = CAMERA_HEIGHT / 2
         self.keys = []
+        self._keys_frame_size = (0, 0)   # track frame size so keyboard rebuilds if needed
         self.message = "Eye mode active"
 
+    # ------------------------------------------------------------------
+    def _start_calibration(self):
+        self.state = "CALIBRATING"
+        self.calib_points = ["TOP-LEFT", "TOP-RIGHT", "BOTTOM-LEFT", "BOTTOM-RIGHT"]
+        self.calib_index = 0
+        self.calib_data = {"x_min": 1.0, "x_max": 0.0, "y_min": 1.0, "y_max": 0.0}
+
+    # ------------------------------------------------------------------
     def tick(self):
         frame, raw_x, raw_y, is_clicking = self.gaze.process()
         frame = cv2.resize(frame, (CAMERA_WIDTH, CAMERA_HEIGHT))
@@ -280,7 +301,7 @@ class EyeMode:
                 self.calib_index += 1
                 if self.calib_index >= len(self.calib_points):
                     self.state = "TYPING"
-                    self.message = "Eye calibration done"
+                    self.message = "Eye calibration done — start typing"
             rendered = self._render_calibration(frame)
             return rendered, None, self.message
 
@@ -309,49 +330,75 @@ class EyeMode:
         rendered = self._render_typing(frame, hovered_char)
         return rendered, spoken_text, self.message
 
+    # ── Calibration screen ──────────────────────────────────────────────
+    # KEY FIX: keep the live camera feed visible so the person can see
+    # themselves during calibration — only a semi-transparent banner on top.
     def _render_calibration(self, frame):
         canvas = frame.copy()
         h, w = canvas.shape[:2]
-        cv2.rectangle(canvas, (0, 0), (w, h), (25, 25, 25), -1)
+
+        banner_h = 160
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (0, 0), (w, banner_h), (15, 15, 15), -1)
+        cv2.addWeighted(overlay, 0.70, canvas, 0.30, 0, canvas)
+
+        step_text = f"Step {self.calib_index + 1} / {len(self.calib_points)}"
+        cv2.putText(canvas, "Eye Tracking Calibration  —  " + step_text,
+                    (24, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
 
         target = self.calib_points[min(self.calib_index, len(self.calib_points) - 1)]
-        cv2.putText(canvas, "Eye Tracking Calibration", (50, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, f"Look at {target} corner and BLINK", (50, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (180, 220, 255), 2, cv2.LINE_AA)
+        instruction = f"Look at RED dot  ({target})  then BLINK to confirm"
+        cv2.putText(canvas, instruction,
+                    (24, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (100, 210, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "Keep your head still and look at the corner",
+                    (24, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (180, 180, 180), 1, cv2.LINE_AA)
 
-        r = 26
-        if target == "TOP-LEFT":
-            cx, cy = 45, 45
-        elif target == "TOP-RIGHT":
-            cx, cy = w - 45, 45
-        elif target == "BOTTOM-LEFT":
-            cx, cy = 45, h - 45
-        else:
-            cx, cy = w - 45, h - 45
-        cv2.circle(canvas, (cx, cy), r, (0, 0, 255), -1)
-        cv2.circle(canvas, (cx, cy), r + 4, (255, 255, 255), 2)
+        margin = 55
+        corner_map = {
+            "TOP-LEFT":     (margin, margin),
+            "TOP-RIGHT":    (w - margin, margin),
+            "BOTTOM-LEFT":  (margin, h - margin),
+            "BOTTOM-RIGHT": (w - margin, h - margin),
+        }
+        cx, cy = corner_map[target]
+        cv2.circle(canvas, (cx, cy), 36, (255, 255, 255), 3)
+        cv2.circle(canvas, (cx, cy), 26, (0, 0, 220), -1)
+        cv2.circle(canvas, (cx, cy), 10, (255, 80, 80), -1)
+
+        done_map = {0: "TOP-LEFT", 1: "TOP-RIGHT", 2: "BOTTOM-LEFT", 3: "BOTTOM-RIGHT"}
+        for i in range(self.calib_index):
+            dx, dy = corner_map[done_map[i]]
+            cv2.circle(canvas, (dx, dy), 14, (60, 200, 100), -1)
+            cv2.putText(canvas, "ok", (dx - 10, dy + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2, cv2.LINE_AA)
+
         return canvas
 
-    def _build_keys(self):
+    # ── Typing keyboard ─────────────────────────────────────────────────
+    def _build_keys(self, w, h):
+        """Rebuild keyboard layout sized to actual frame dimensions."""
         self.keys = []
         y_start = 215
-        key_h = (CAMERA_HEIGHT - y_start - 20) // 3
+        key_h = max(30, (h - y_start - 20) // 3)
 
-        pred_w = (CAMERA_WIDTH - 40) // 4
+        # Prediction row: 4 word predictions + 1 purple RECAL button
+        n_slots = 5
+        pred_w = max(20, (w - 40) // n_slots)
         for i in range(4):
             x1 = 20 + i * pred_w
             x2 = x1 + pred_w - 8
-            y1 = 115
-            y2 = 190
-            self.keys.append((x1, y1, x2, y2, f"PRED_{i}"))
+            self.keys.append((x1, 115, x2, 190, f"PRED_{i}"))
+        x1 = 20 + 4 * pred_w
+        x2 = x1 + pred_w - 8
+        self.keys.append((x1, 115, x2, 190, "RECAL"))
 
         layout = [
             ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"],
             ["A", "S", "D", "F", "G", "H", "J", "K", "L", "DEL"],
             ["Z", "X", "C", "V", "B", "N", "M", "SPACE", "CLR", "SPEAK"],
         ]
-
         for row_idx, row in enumerate(layout):
-            key_w = (CAMERA_WIDTH - 40) // len(row)
+            key_w = max(20, (w - 40) // len(row))
             for col_idx, char in enumerate(row):
                 x1 = 20 + col_idx * key_w
                 y1 = y_start + row_idx * key_h
@@ -360,16 +407,22 @@ class EyeMode:
                 self.keys.append((x1, y1, x2, y2, char))
 
     def _render_typing(self, frame, hovered_char):
-        if not self.keys:
-            self._build_keys()
+        h, w = frame.shape[:2]
+
+        # BUG FIX: keyboard was built once from constants; now it rebuilds
+        # automatically if the rendered frame size changes.
+        if self._keys_frame_size != (w, h):
+            self._build_keys(w, h)
+            self._keys_frame_size = (w, h)
 
         canvas = frame.copy()
-        h, w = canvas.shape[:2]
 
         cv2.rectangle(canvas, (0, 0), (w, 105), (20, 20, 20), -1)
         display_text = (self.current_text + "|")[-75:]
-        cv2.putText(canvas, "Eye Tracking Mode", (18, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, display_text, (18, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (245, 245, 245), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "Eye Tracking Mode", (18, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, display_text, (18, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.95, (245, 245, 245), 2, cv2.LINE_AA)
 
         for x1, y1, x2, y2, key in self.keys:
             bg = self._key_color(key)
@@ -382,11 +435,12 @@ class EyeMode:
             if key.startswith("PRED_"):
                 idx = int(key.split("_")[1])
                 text = self.predictions[idx] if idx < len(self.predictions) else ""
-            fs = 0.6 if key == "SPEAK" else 0.75
+            fs = 0.55 if key in {"SPEAK", "SPACE", "RECAL"} else 0.72
             tw = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, 2)[0][0]
-            tx = x1 + max(8, (x2 - x1 - tw) // 2)
+            tx = x1 + max(4, (x2 - x1 - tw) // 2)
             ty = y1 + (y2 - y1) // 2 + 8
-            cv2.putText(canvas, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(canvas, text, (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), 2, cv2.LINE_AA)
 
         cv2.circle(canvas, (int(self.cursor_x), int(self.cursor_y)), 10, (0, 255, 255), -1)
         return canvas
@@ -398,6 +452,8 @@ class EyeMode:
             return (42, 90, 42)
         if key == "SPEAK":
             return (164, 85, 0)
+        if key == "RECAL":
+            return (90, 42, 90)
         if key.startswith("PRED_"):
             return (70, 70, 70)
         return (42, 42, 42)
@@ -418,6 +474,14 @@ class EyeMode:
     def _process_key_click(self, char):
         spoken_text = None
 
+        if char == "RECAL":
+            # NEW: allow recalibration at any time from the typing screen
+            self._start_calibration()
+            self.keys = []
+            self._keys_frame_size = (0, 0)
+            self.message = "Recalibrating…"
+            return None
+
         if char.startswith("PRED_"):
             idx = int(char.split("_")[1])
             if self.predictions[idx]:
@@ -425,7 +489,11 @@ class EyeMode:
                 if " " in pred:
                     self.current_text += pred + " "
                 else:
-                    self.current_text = self.current_text[:-len(self.current_word)] + pred + " "
+                    # BUG FIX: original slice [-0:] returned the whole string
+                    # when current_word was empty, causing text duplication.
+                    if self.current_word:
+                        self.current_text = self.current_text[: -len(self.current_word)]
+                    self.current_text += pred + " "
                 self.current_word = ""
                 self.llm.request_next_words(self.current_text)
         elif char == "SPACE":
@@ -441,6 +509,7 @@ class EyeMode:
         elif char == "CLR":
             self.current_text = ""
             self.current_word = ""
+            self.predictions = ["", "", "", ""]
         elif char == "SPEAK":
             spoken_text = self.current_text.strip()
             self.message = "Eye mode speak triggered" if spoken_text else "Nothing to speak"

@@ -64,7 +64,16 @@ class TFLiteSignPredictor:
         if missing:
             raise FileNotFoundError("Missing ASL assets: " + ", ".join(missing))
 
-        from tflite_runtime.interpreter import Interpreter
+        # BUG FIX: was a bare import — if tflite_runtime is not installed this
+        # raised an ImportError that propagated all the way up and crashed the app.
+        # Now it raises a clear RuntimeError so ASLMode can surface a friendly message.
+        try:
+            from tflite_runtime.interpreter import Interpreter
+        except ImportError as exc:
+            raise RuntimeError(
+                "tflite_runtime is not installed. "
+                "Run: pip install tflite-runtime"
+            ) from exc
 
         self.interpreter = Interpreter(model_path=str(self.model_path))
         self.interpreter.allocate_tensors()
@@ -171,15 +180,28 @@ class StableTextComposer:
 
 
 class ASLMode:
+    # Blank frame shown if the camera drops and cannot be reopened immediately
+    _BLANK = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
+
     def __init__(self):
+        # BUG FIX: predictor errors (ImportError / missing assets) used to
+        # propagate uncaught and crash the whole app.  Now we surface a clear
+        # message and leave self._predictor_error set so tick() can display it.
+        self._predictor_error: str | None = None
+        try:
+            self.predictor = TFLiteSignPredictor()
+        except (FileNotFoundError, RuntimeError) as exc:
+            self._predictor_error = str(exc)
+            self.predictor = None
+
         self.capture = cv2.VideoCapture(CAMERA_INDEX)
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
         self.capture.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
         if not self.capture.isOpened():
-            raise RuntimeError("Could not open camera for ASL mode")
+            # Don't crash — tick() will show the error on-screen
+            self.capture = None
 
-        self.predictor = TFLiteSignPredictor()
         self.composer = StableTextComposer(
             confidence_threshold=ASL_CONFIDENCE_THRESHOLD,
             hold_seconds=ASL_HOLD_SECONDS,
@@ -201,10 +223,33 @@ class ASLMode:
             model_complexity=0,
         )
 
+    # ------------------------------------------------------------------
     def tick(self):
+        # Surface predictor load errors without crashing
+        if self._predictor_error:
+            frame = self._BLANK.copy()
+            cv2.putText(frame, "ASL model error:", (20, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 80, 220), 2, cv2.LINE_AA)
+            for i, line in enumerate(self._predictor_error.split(". ")):
+                cv2.putText(frame, line, (20, 100 + i * 36),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (220, 220, 220), 2, cv2.LINE_AA)
+            return frame, None, self._predictor_error
+
+        # BUG FIX: was a hard raise RuntimeError that crashed the app.
+        # Now we return a blank frame with an on-screen message so the UI
+        # stays alive and can be closed gracefully.
+        if self.capture is None or not self.capture.isOpened():
+            frame = self._BLANK.copy()
+            cv2.putText(frame, "Camera unavailable", (20, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 80, 220), 2, cv2.LINE_AA)
+            return frame, None, "Camera unavailable"
+
         ok, frame = self.capture.read()
         if not ok:
-            raise RuntimeError("Camera frame capture failed in ASL mode")
+            # Try to re-open on the next tick instead of crashing
+            self.capture.release()
+            self.capture = cv2.VideoCapture(CAMERA_INDEX)
+            return self._BLANK.copy(), None, "Camera read failed — retrying…"
 
         frame = cv2.flip(frame, 1)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -228,7 +273,9 @@ class ASLMode:
                 self.mp_styles.get_default_hand_connections_style(),
             )
 
-            points = np.array([[p.x, p.y, p.z] for p in hand_landmarks.landmark], dtype=np.float32)
+            points = np.array(
+                [[p.x, p.y, p.z] for p in hand_landmarks.landmark], dtype=np.float32
+            )
             hand_center_x = float(points[:, 0].mean())
             pred_label, confidence, top3 = self.predictor.predict(points.flatten())
             normalized = normalize_prediction_label(pred_label)
@@ -294,27 +341,51 @@ class ASLMode:
         h, w = frame.shape[:2]
 
         cv2.rectangle(frame, (0, 0), (w, 100), (20, 20, 20), -1)
-        cv2.putText(frame, "ASL Finger Recognition Mode", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, "ASL Finger Recognition Mode", (20, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
         label = analysis.smoothed_label if analysis.smoothed_label else "--"
-        cv2.putText(frame, f"Label: {label}", (20, 67), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 230, 170), 2, cv2.LINE_AA)
-        cv2.putText(frame, f"Conf: {analysis.confidence:.0%}", (230, 67), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"Label: {label}", (20, 67),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 230, 170), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"Conf: {analysis.confidence:.0%}", (230, 67),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
+
+        # Hold progress bar under the label
+        if compose_result["progress"] > 0 and not in_send_zone:
+            bar_full = w - 400
+            bar_fill = int(bar_full * compose_result["progress"])
+            cv2.rectangle(frame, (20, 78), (20 + bar_full, 90), (50, 50, 50), -1)
+            cv2.rectangle(frame, (20, 78), (20 + bar_fill, 90), (100, 220, 140), -1)
 
         send_zone_start = int(w * (1.0 - ASL_SEND_ZONE_RATIO))
         zone_color = (40, 160, 80) if in_send_zone else (50, 80, 100)
         cv2.rectangle(frame, (send_zone_start, 0), (w, h), zone_color, 2)
-        cv2.putText(frame, "SEND", (send_zone_start + 15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, "SEND", (send_zone_start + 15, 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
+        # Vertical send-dwell progress bar
         bar_h = h - 140
         bar_top = 110
         bar_x1 = w - 30
         cv2.rectangle(frame, (bar_x1, bar_top), (bar_x1 + 14, bar_top + bar_h), (40, 40, 40), -1)
         if in_send_zone and self.send_progress > 0:
             fill = int(bar_h * self.send_progress)
-            cv2.rectangle(frame, (bar_x1, bar_top + bar_h - fill), (bar_x1 + 14, bar_top + bar_h), (255, 180, 84), -1)
+            cv2.rectangle(
+                frame,
+                (bar_x1, bar_top + bar_h - fill),
+                (bar_x1 + 14, bar_top + bar_h),
+                (255, 180, 84),
+                -1,
+            )
 
         cv2.rectangle(frame, (0, h - 110), (w, h), (20, 20, 20), -1)
-        cv2.putText(frame, f"Sentence: {self.composer.buffer or '...'}", (20, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (240, 240, 240), 2, cv2.LINE_AA)
-        cv2.putText(frame, self.message, (20, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 210, 120), 2, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            f"Sentence: {self.composer.buffer or '...'}",
+            (20, h - 70),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (240, 240, 240), 2, cv2.LINE_AA,
+        )
+        cv2.putText(frame, self.message, (20, h - 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 210, 120), 2, cv2.LINE_AA)
 
         return frame
 

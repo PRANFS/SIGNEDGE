@@ -19,6 +19,7 @@ class UnifiedSignEdgeApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(WINDOW_TITLE)
+        self.root.configure(bg="#0d0f12")
         self._maximize_window()
 
         self.transcript = TranscriptStore()
@@ -36,6 +37,7 @@ class UnifiedSignEdgeApp:
         self._current_image = None
 
         self._build_ui()
+        self._bind_keys()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def _maximize_window(self):
@@ -44,40 +46,68 @@ class UnifiedSignEdgeApp:
             return
         except tk.TclError:
             pass
-
         try:
             self.root.attributes("-zoomed", True)
             return
         except tk.TclError:
             pass
-
         width = self.root.winfo_screenwidth()
         height = self.root.winfo_screenheight()
         self.root.geometry(f"{width}x{height}+0+0")
 
     def _build_ui(self):
-        self.root.columnconfigure(0, weight=3)
-        self.root.columnconfigure(1, weight=1)
+        # 70 % video | 30 % chat
+        self.root.columnconfigure(0, weight=7)
+        self.root.columnconfigure(1, weight=3)
         self.root.rowconfigure(0, weight=1)
 
-        left_frame = ttk.Frame(self.root)
-        left_frame.grid(row=0, column=0, sticky="nsew")
+        # ── LEFT: thin status bar + video ──
+        left_frame = tk.Frame(self.root, bg="#0d0f12")
+        left_frame.grid(row=0, column=0, sticky="nsew", padx=(6, 3), pady=6)
         left_frame.columnconfigure(0, weight=1)
         left_frame.rowconfigure(1, weight=1)
 
-        self.status_var = tk.StringVar(value="Starting...")
-        status_lbl = ttk.Label(left_frame, textvariable=self.status_var, font=("Segoe UI", 11))
-        status_lbl.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        self.status_var = tk.StringVar(value="Starting…")
+        status_lbl = tk.Label(
+            left_frame,
+            textvariable=self.status_var,
+            font=("Segoe UI", 10),
+            bg="#0d0f12",
+            fg="#9ca3af",
+            anchor="w",
+        )
+        status_lbl.grid(row=0, column=0, sticky="ew", padx=4, pady=(2, 2))
 
-        self.video_label = ttk.Label(left_frame)
-        self.video_label.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        # Video fills all remaining space
+        self.video_label = tk.Label(left_frame, bg="#0d0f12", anchor="center")
+        self.video_label.grid(row=1, column=0, sticky="nsew")
 
-        right_frame = ttk.Frame(self.root)
-        right_frame.grid(row=0, column=1, sticky="nsew")
+        # ── RIGHT: chat panel ──
+        right_frame = tk.Frame(self.root, bg="#0d0f12")
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=(3, 6), pady=6)
+        right_frame.columnconfigure(0, weight=1)
+        right_frame.rowconfigure(0, weight=1)
+
         self.chat_panel = ChatPanel(right_frame)
 
+    def _bind_keys(self):
+        # Press Escape at any time to restart mode selection
+        self.root.bind("<Escape>", lambda _: self._restart_gate())
+
+    def _restart_gate(self):
+        """Return to the startup gate so the user can switch between eye / ASL mode."""
+        self._close_current_mode()
+        self.mode = "BOOT_GATE"
+        self.gate_mode = StartupGate()
+        self.mode_message = "Mode selection restarted"
+        self.transcript.append("SYS", "Mode selection restarted (Escape pressed)")
+
     def start(self):
-        self.transcript.append("SYS", "App started. Default path is eye mode unless hand is raised in 10s.")
+        self.transcript.append(
+            "SYS",
+            "App started. Default path is eye mode unless hand is raised in 10s. "
+            "Press Escape at any time to restart mode selection.",
+        )
         self._tick()
         self.root.mainloop()
 
@@ -96,15 +126,14 @@ class UnifiedSignEdgeApp:
         self.transcript.append("SYS", "Switched to ASL finger recognition mode")
 
     def _close_current_mode(self):
-        if self.gate_mode is not None:
-            self.gate_mode.close()
-            self.gate_mode = None
-        if self.eye_mode is not None:
-            self.eye_mode.close()
-            self.eye_mode = None
-        if self.asl_mode is not None:
-            self.asl_mode.close()
-            self.asl_mode = None
+        for attr in ("gate_mode", "eye_mode", "asl_mode"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
     def _drain_stt_events(self):
         while True:
@@ -112,7 +141,6 @@ class UnifiedSignEdgeApp:
                 event_type, message = self.stt_engine.event_queue.get_nowait()
             except queue.Empty:
                 break
-
             if event_type == "partial":
                 self.stt_partial = message
             elif event_type == "final":
@@ -127,11 +155,13 @@ class UnifiedSignEdgeApp:
                 event_type, message = self.speaker.event_queue.get_nowait()
             except queue.Empty:
                 break
-            if event_type in {"ready", "error"}:
+            # BUG FIX: original only handled "ready" and "error".
+            # "status" events (e.g. Piper fallback notice) were silently dropped.
+            if event_type in {"ready", "error", "status"}:
                 self.transcript.append("SYS", message)
 
     def _handle_mode_tick(self):
-        if self.mode == "BOOT_GATE":
+        if self.mode == "BOOT_GATE" and self.gate_mode is not None:
             frame, select_asl, timeout = self.gate_mode.tick()
             self.mode_message = "Startup gate (raise hand for ASL)"
             if select_asl:
@@ -165,9 +195,24 @@ class UnifiedSignEdgeApp:
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(frame_rgb)
 
-        pane_w = max(320, self.video_label.winfo_width())
-        pane_h = max(240, self.video_label.winfo_height())
-        image.thumbnail((pane_w, pane_h))
+        # BUG FIX 1: image.thumbnail() only *shrinks* — it never upscales a
+        # small frame to fill a larger pane.  Use resize() with a proper scale.
+        # BUG FIX 2: winfo_width/height return 1 before the window is fully
+        # drawn, giving a 320×240 floor that causes wrong scaling on the first
+        # few frames.  Use the screen geometry as a more reliable lower bound.
+        pane_w = self.video_label.winfo_width()
+        pane_h = self.video_label.winfo_height()
+        if pane_w < 100 or pane_h < 100:
+            # Window not yet drawn — use half the screen as a safe default
+            pane_w = self.root.winfo_screenwidth() // 2
+            pane_h = self.root.winfo_screenheight()
+
+        img_w, img_h = image.size
+        if img_w > 0 and img_h > 0:
+            scale = min(pane_w / img_w, pane_h / img_h)
+            new_w = max(1, int(img_w * scale))
+            new_h = max(1, int(img_h * scale))
+            image = image.resize((new_w, new_h), Image.LANCZOS)
 
         self._current_image = ImageTk.PhotoImage(image=image)
         self.video_label.configure(image=self._current_image)
@@ -176,11 +221,20 @@ class UnifiedSignEdgeApp:
         self._drain_stt_events()
         self._drain_tts_events()
 
-        frame = self._handle_mode_tick()
+        # Wrap the mode tick so a crash in one frame doesn't kill the whole app
+        try:
+            frame = self._handle_mode_tick()
+        except Exception as exc:
+            self.transcript.append("SYS", f"Mode error: {exc}")
+            frame = None
+
         self._render_frame(frame)
 
-        partial = f" | STT: {self.stt_partial}" if self.stt_partial else ""
-        self.status_var.set(f"Mode: {self.mode} | {self.mode_message}{partial}")
+        partial = f"  ·  STT: {self.stt_partial}" if self.stt_partial else ""
+        self.status_var.set(
+            f"Mode: {self.mode}  ·  {self.mode_message}{partial}"
+            "    [Esc = switch mode]"
+        )
 
         self.chat_panel.refresh(self.transcript.snapshot())
 
