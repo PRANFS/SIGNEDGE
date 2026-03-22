@@ -22,6 +22,122 @@ Core Constraints & Design Principles
 - Hardware must stay within Raspberry Pi 5 (8 GB RAM) thermal & resource limits
 
 Hardware Platform
+----------------
+To ensure that the system meets the strict real-time (<100 ms), offline, and privacy-first constraints of the project, we conducted a detailed 
+evaluation of multiple edge hardware platforms before finalizing our choice.
+
+Evaluation Criteria
+The hardware selection was guided by the following requirements:
+• Sufficient RAM for concurrent audio + vision pipelines 
+• Ability to sustain real-time inference workloads
+• Stability under continuous operation
+• Mature software ecosystem with minimal integration risk
+• Compatibility with fully offline deployment
+
+=======================================================
+
+Evaluated Options
+1. Raspberry Pi Zero 2 W
+
+Limitations Identified:
+• Severe RAM Constraints (512 MB total)
+After OS, drivers, and runtime initialization, very limited memory remains
+
+Insufficient headroom for:
+    • Model loading
+    • Frame buffering
+    • Continuous inference
+
+Performance Bottlenecks
+•   Real-time vision workloads operate under heavy memory pressure
+•   Estimated performance: ~1–3 FPS
+•   Not suitable for sub-100 ms latency target
+
+
+System Stability Risks
+•   High likelihood of crashes or slowdowns during prolonged operation
+•   No scalability for future feature expansion
+
+Conclusion:
+Not viable for reliable, real-time edge AI workloads.
+
+=======================================================
+2. Milk-V Duo (with NPU)
+Advantages Considered:
+•   Integrated NPU with promising theoretical performance
+•   Low-power edge AI design
+
+Critical Constraints Identified:
+•   Memory Limitations (512 MB configuration)
+•   Estimated application requirement: 150–200 MB
+
+After OS load → minimal remaining headroom
+
+High risk of:
+•   Runtime instability
+•   Memory exhaustion during inference
+
+Immature Software Ecosystem
+•   Requires model conversion to proprietary SOPHON format
+•   Limited documentation and tooling support
+•   Incomplete operator support for common ML layers
+
+Development Risk
+•   Unsupported layers fall back to CPU execution
+•   Increased debugging complexity
+•   Reduced real-world performance vs theoretical NPU capability
+
+Conclusion:
+High integration risk and unsuitable within the project’s limited timeline.
+=======================================================
+Final Decision: Raspberry Pi 5 (8 GB RAM)
+The Raspberry Pi 5 was selected as the primary edge device due to its superior balance of performance, reliability, and ecosystem maturity.
+
+Key Advantages
+•   Significantly Higher Memory Capacity
+8 GB RAM provides ample headroom for: OS + runtime
+Vision pipeline (MediaPipe + MLP)
+Audio pipeline (speech-to-text model)
+Eliminates memory pressure seen in alternative platforms
+
+Stable Real-Time Performance
+•   Capable of sustaining:
+~30–40 ms vision loop
+~51 ms total system latency
+Meets sub-100 ms project requirement
+
+Mature Software Ecosystem
+•   Extensive community support and documentation
+•   Native compatibility with:
+    MediaPipe
+    Python ML stack
+
+Audio processing libraries
+•   No need for proprietary model conversion pipelines
+
+Low Development Risk
+•   Rapid prototyping and debugging
+•   Predictable performance characteristics
+•   Strong tooling support
+
+Scalability
+•   Supports future enhancements such as:
+    Larger models, Multi-modal fusion improvements, Additional sensors or features
+
+Optional Hardware Enhancements
+To further optimize system performance:
+
+•     Hailo AI Accelerator (if available)
+Offloads inference workload from CPU
+Improves throughput and latency consistency
+
+•   Ribbon Cable Camera Module (CSI)
+Lower latency compared to USB webcams
+Reduced CPU overhead
+Dedicated bandwidth and more stable frame timing
+
+=======================================================
+Software Architecture & Data Flow
 -----------------
 Central node: Raspberry Pi 5 (8 GB RAM variant)
 Inputs:
