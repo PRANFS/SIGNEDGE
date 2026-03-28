@@ -1,5 +1,0 @@
-create venv
-sudo apt update
-sudo apt install build-essential cmake espeak -y
-CMAKE_ARGS="-DGGML_NATIVE=ON" pip install llama-cpp-python==0.3.16
-pip install -r requirements.txt
